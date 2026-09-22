@@ -1,0 +1,35 @@
+name: 🔄 Sync Workato Projects
+
+on:
+  schedule:
+    - cron: '0 2 * * *'    # Every night at 02:00 UTC
+  workflow_dispatch:         # Also allow manual trigger
+
+jobs:
+  sync:
+    name: Fetch Projects from Workato API
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Fetch Top-Level Projects
+        run: |
+          curl -s \
+            -H "Authorization: Bearer ${{ secrets.WORKATO_DEV_API_TOKEN }}" \
+            "${{ vars.WORKATO_BASE_URL }}/api/folders" \
+          | jq '[.[] 
+                 | select(.parent_folder_id == null) 
+                 | {name: .name, folder_id: (.id | tostring)}]' \
+          > .github/workato/projects.json
+
+          echo "✅ Projects synced:"
+          cat .github/workato/projects.json | jq -r '.[].name'
+
+      - name: Commit if Changed
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add .github/workato/projects.json
+          git diff --staged --quiet \
+            && echo "No changes to sync" \
+            || (git commit -m "🔄 Sync Workato projects [skip ci]" && git push)
