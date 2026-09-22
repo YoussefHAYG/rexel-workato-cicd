@@ -31,24 +31,20 @@ jobs:
     outputs:
       folder_id: ${{ steps.resolve.outputs.folder_id }}
     steps:
-      - name: Fetch Projects from Workato API & Resolve Folder ID
+      - uses: actions/checkout@v3
+
+      - name: Resolve Folder ID from projects.json
         id: resolve
         run: |
           PROJECT="${{ github.event.inputs.project_name }}"
 
-          # Fetch live from Workato API (no file needed)
-          FOLDERS=$(curl -s \
-            -H "Authorization: Bearer ${{ secrets.WORKATO_DEV_API_TOKEN }}" \
-            "${{ env.WORKATO_BASE_URL }}/api/folders")
-
-          FOLDER_ID=$(echo $FOLDERS | jq -r \
+          FOLDER_ID=$(jq -r \
             --arg name "$PROJECT" \
-            '[.[] | select(.parent_folder_id == null)] | .[] | select(.name == $name) | .id | tostring')
+            '.[] | select(.name == $name) | .folder_id' \
+            .github/workato/projects.json)
 
           if [ -z "$FOLDER_ID" ] || [ "$FOLDER_ID" = "null" ]; then
-            echo "❌ Project '$PROJECT' not found in Workato."
-            echo "Available top-level projects:"
-            echo $FOLDERS | jq -r '[.[] | select(.parent_folder_id == null)] | .[].name'
+            echo "❌ Project '$PROJECT' not found. Run the Sync workflow first."
             exit 1
           fi
 
@@ -85,15 +81,14 @@ jobs:
           MANIFEST_ID=$(echo $RESPONSE | jq -r '.id')
 
           if [ -z "$MANIFEST_ID" ] || [ "$MANIFEST_ID" = "null" ]; then
-            echo "❌ Failed to create manifest."
-            echo "API Response: $RESPONSE"
+            echo "❌ Failed to create manifest: $RESPONSE"
             exit 1
           fi
 
           echo "manifest_id=$MANIFEST_ID" >> $GITHUB_OUTPUT
           echo "✅ Manifest created: $MANIFEST_ID"
 
-      - name: Trigger Package Export
+      - name: Trigger Export
         id: export
         run: |
           RESPONSE=$(curl -s -X POST \
@@ -101,13 +96,6 @@ jobs:
             "${{ env.WORKATO_BASE_URL }}/api/packages/export/${{ steps.manifest.outputs.manifest_id }}")
 
           PACKAGE_ID=$(echo $RESPONSE | jq -r '.id')
-
-          if [ -z "$PACKAGE_ID" ] || [ "$PACKAGE_ID" = "null" ]; then
-            echo "❌ Failed to trigger export."
-            echo "API Response: $RESPONSE"
-            exit 1
-          fi
-
           echo "package_id=$PACKAGE_ID" >> $GITHUB_OUTPUT
           echo "✅ Export triggered: Package ID $PACKAGE_ID"
 
@@ -128,11 +116,10 @@ jobs:
           done
 
           if [ "$STATUS" != "completed" ]; then
-            echo "❌ Export timed out after 4 minutes."
+            echo "❌ Export timed out after 4 minutes"
             exit 1
           fi
-
-          echo "✅ Export completed successfully"
+          echo "✅ Export completed"
 
       - name: Download Package
         run: |
@@ -156,7 +143,7 @@ jobs:
     needs: [resolve, export]
     runs-on: ubuntu-latest
     if: github.event.inputs.target_env == 'test'
-    environment: test      # 👈 Pauses here — requires 1 reviewer approval
+    environment: test      # 👈 Pauses here for reviewer approval
     steps:
       - name: Download Package
         uses: actions/download-artifact@v3
@@ -171,24 +158,21 @@ jobs:
             --data-binary @package.zip \
             "${{ env.WORKATO_BASE_URL }}/api/packages/import/${{ needs.resolve.outputs.folder_id }}?restart_recipes=true")
 
-          echo "API Response: $RESPONSE"
+          echo "Response: $RESPONSE"
           STATUS=$(echo $RESPONSE | jq -r '.status // "unknown"')
 
           if [ "$STATUS" = "failed" ]; then
-            echo "❌ Deployment to TEST failed."
+            echo "❌ Deployment failed: $RESPONSE"
             exit 1
           fi
-
           echo "✅ Deployed to TEST. Status: $STATUS"
 
-      - name: Write Deployment Summary
+      - name: Write Summary
         run: |
           echo "## ✅ Deployed to TEST" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "| Field | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "| | |" >> $GITHUB_STEP_SUMMARY
           echo "|---|---|" >> $GITHUB_STEP_SUMMARY
           echo "| **Project** | ${{ github.event.inputs.project_name }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| **Environment** | TEST |" >> $GITHUB_STEP_SUMMARY
           echo "| **Deployed by** | @${{ github.actor }} |" >> $GITHUB_STEP_SUMMARY
           echo "| **Run** | #${{ github.run_number }} |" >> $GITHUB_STEP_SUMMARY
           echo "| **Notes** | ${{ github.event.inputs.notes }} |" >> $GITHUB_STEP_SUMMARY
@@ -199,7 +183,7 @@ jobs:
     needs: [resolve, export]
     runs-on: ubuntu-latest
     if: github.event.inputs.target_env == 'prod'
-    environment: prod      # 👈 Pauses here — requires 2 reviewer approvals
+    environment: prod      # 👈 Pauses here for 2 reviewer approvals
     steps:
       - name: Download Package
         uses: actions/download-artifact@v3
@@ -214,24 +198,21 @@ jobs:
             --data-binary @package.zip \
             "${{ env.WORKATO_BASE_URL }}/api/packages/import/${{ needs.resolve.outputs.folder_id }}?restart_recipes=true")
 
-          echo "API Response: $RESPONSE"
+          echo "Response: $RESPONSE"
           STATUS=$(echo $RESPONSE | jq -r '.status // "unknown"')
 
           if [ "$STATUS" = "failed" ]; then
-            echo "❌ Deployment to PROD failed."
+            echo "❌ Deployment failed: $RESPONSE"
             exit 1
           fi
-
           echo "✅ Deployed to PROD. Status: $STATUS"
 
-      - name: Write Deployment Summary
+      - name: Write Summary
         run: |
           echo "## ✅ Deployed to PROD" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "| Field | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "| | |" >> $GITHUB_STEP_SUMMARY
           echo "|---|---|" >> $GITHUB_STEP_SUMMARY
           echo "| **Project** | ${{ github.event.inputs.project_name }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| **Environment** | PROD |" >> $GITHUB_STEP_SUMMARY
           echo "| **Deployed by** | @${{ github.actor }} |" >> $GITHUB_STEP_SUMMARY
           echo "| **Run** | #${{ github.run_number }} |" >> $GITHUB_STEP_SUMMARY
           echo "| **Notes** | ${{ github.event.inputs.notes }} |" >> $GITHUB_STEP_SUMMARY
