@@ -2,77 +2,101 @@ name: 🔄 Sync Workato Projects
 
 on:
   schedule:
-    - cron: '0 2 * * *'    # Every night at 02:00 UTC
+    - cron: "0 2 * * *"
   workflow_dispatch:
+
+permissions:
+  contents: write
 
 jobs:
   sync:
     name: Fetch Projects & Update Deploy Dropdown
     runs-on: ubuntu-latest
+
     steps:
-      - uses: actions/checkout@v3
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.REPO_PUSH_TOKEN }}
 
       - name: Fetch Top-Level Projects from Workato
-        id: fetch
         run: |
-          FOLDERS=$(curl -s \
-            -H "Authorization: Bearer ${{ secrets.WORKATO_DEV_API_TOKEN }}" \
-            "${{ vars.WORKATO_BASE_URL }}/api/folders")
+          set -euo pipefail
 
-          # Save projects.json
-          mkdir -p .github/workato
-          echo $FOLDERS | jq '[.[] 
-            | select(.parent_folder_id == null) 
-            | {name: .name, folder_id: (.id | tostring)}]' \
-          > .github/workato/projects.json
+          curl --fail --silent --show-error \
+            -H "Authorization: Bearer ${{ secrets.WORKATO_DEV_API_TOKEN }}" \
+            "${{ vars.WORKATO_BASE_URL }}/api/folders" \
+            | jq '[
+                .[]
+                | select(.parent_folder_id == null)
+                | {
+                    name: .name,
+                    folder_id: (.id | tostring)
+                  }
+              ]' > .github/workato/projects.json
 
           echo "✅ Projects fetched:"
-          cat .github/workato/projects.json | jq -r '.[].name'
+          jq -r '.[].name' .github/workato/projects.json
 
       - name: Update Dropdown Options in Deploy Workflow
         run: |
-          # Build the options block from project names
-          OPTIONS=$(cat .github/workato/projects.json | jq -r \
-            '[.[].name] | map("          - " + .) | join("\n")')
+          set -euo pipefail
 
-          echo "Injecting these options into deploy workflow:"
-          echo "$OPTIONS"
-
-          # Replace everything between the markers in the deploy YAML
-          python3 - <<'EOF'
+          python3 - <<'PY'
+          import json
           import re
+          from pathlib import Path
 
-          with open('.github/workflows/workato-deploy.yml', 'r') as f:
-              content = f.read()
+          projects_file = Path(".github/workato/projects.json")
+          workflow_file = Path(".github/workflows/workato-deploy.yml")
 
-          import subprocess
-          result = subprocess.run(
-              ['jq', '-r', '[.[].name] | map("          - " + .) | join("\n")',
-               '.github/workato/projects.json'],
-              capture_output=True, text=True
+          projects = json.loads(projects_file.read_text())
+          options = "\n".join(
+              f"          - {project['name']}"
+              for project in projects
           )
-          options = result.stdout.strip()
 
-          # Replace the options block between markers
-          new_block = "# AUTO-GENERATED START\n          options:\n" + options + "\n          # AUTO-GENERATED END"
-          content = re.sub(
-              r'# AUTO-GENERATED START.*?# AUTO-GENERATED END',
+          content = workflow_file.read_text()
+
+          new_block = (
+              "# AUTO-GENERATED START\n"
+              "          options:\n"
+              f"{options}\n"
+              "          # AUTO-GENERATED END"
+          )
+
+          updated_content, replacements = re.subn(
+              r"# AUTO-GENERATED START.*?# AUTO-GENERATED END",
               new_block,
               content,
-              flags=re.DOTALL
+              flags=re.DOTALL,
           )
 
-          with open('.github/workflows/workato-deploy.yml', 'w') as f:
-              f.write(content)
+          if replacements != 1:
+              raise SystemExit(
+                  "Expected exactly one AUTO-GENERATED block, "
+                  f"but found {replacements}"
+              )
 
+          workflow_file.write_text(updated_content)
           print("✅ Deploy workflow updated with latest project options")
-          EOF
+          PY
 
-      - name: Commit Changes
+      - name: Commit and push changes
         run: |
+          set -euo pipefail
+
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add .github/workato/projects.json .github/workflows/workato-deploy.yml
-          git diff --staged --quiet \
-            && echo "No changes detected" \
-            || (git commit -m "🔄 Sync Workato project dropdown [skip ci]" && git push)
+
+          git add \
+            .github/workato/projects.json \
+            .github/workflows/workato-deploy.yml
+
+          if git diff --staged --quiet; then
+            echo "No changes detected"
+          else
+            git commit -m "🔄 Sync Workato project dropdown [skip ci]"
+            git push origin HEAD:main
+          fi
