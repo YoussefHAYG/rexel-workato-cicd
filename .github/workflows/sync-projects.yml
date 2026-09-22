@@ -61,7 +61,7 @@ jobs:
 
           new_block = (
               "# AUTO-GENERATED START\n"
-              "          options:\n"
+              "        options:\n"
               f"{options}\n"
               "          # AUTO-GENERATED END"
           )
