@@ -1,0 +1,58 @@
+[
+  {
+    "name": "AIRO Claude",
+    "folder_id": "2302900"
+  },
+  {
+    "name": "Submit Integration Request",
+    "folder_id": "2258422"
+  },
+  {
+    "name": "CICD Automation",
+    "folder_id": "1547104"
+  },
+  {
+    "name": "RBT",
+    "folder_id": "1516315"
+  },
+  {
+    "name": "FR_POC_API_SnowFlake_V1",
+    "folder_id": "1497259"
+  },
+  {
+    "name": "FR_AB_API_TEMPLATE_V1",
+    "folder_id": "1492999"
+  },
+  {
+    "name": "CH_POC_GENERIC_TEMPLATE_V1",
+    "folder_id": "1492982"
+  },
+  {
+    "name": "01-Common",
+    "folder_id": "1492879"
+  },
+  {
+    "name": "Autonomous Operations Framework AOF",
+    "folder_id": "1491165"
+  },
+  {
+    "name": "Templates",
+    "folder_id": "1490883"
+  },
+  {
+    "name": "Automation Quality & Security AHQ",
+    "folder_id": "1490856"
+  },
+  {
+    "name": "iPaaS POC",
+    "folder_id": "1147817"
+  },
+  {
+    "name": "Spring",
+    "folder_id": "834876"
+  },
+  {
+    "name": "Finance",
+    "folder_id": "798316"
+  }
+]
