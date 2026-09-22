@@ -3,33 +3,76 @@ name: 🔄 Sync Workato Projects
 on:
   schedule:
     - cron: '0 2 * * *'    # Every night at 02:00 UTC
-  workflow_dispatch:         # Also allow manual trigger
+  workflow_dispatch:
 
 jobs:
   sync:
-    name: Fetch Projects from Workato API
+    name: Fetch Projects & Update Deploy Dropdown
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v3
 
-      - name: Fetch Top-Level Projects
+      - name: Fetch Top-Level Projects from Workato
+        id: fetch
         run: |
-          curl -s \
+          FOLDERS=$(curl -s \
             -H "Authorization: Bearer ${{ secrets.WORKATO_DEV_API_TOKEN }}" \
-            "${{ vars.WORKATO_BASE_URL }}/api/folders" \
-          | jq '[.[] 
-                 | select(.parent_folder_id == null) 
-                 | {name: .name, folder_id: (.id | tostring)}]' \
+            "${{ vars.WORKATO_BASE_URL }}/api/folders")
+
+          # Save projects.json
+          mkdir -p .github/workato
+          echo $FOLDERS | jq '[.[] 
+            | select(.parent_folder_id == null) 
+            | {name: .name, folder_id: (.id | tostring)}]' \
           > .github/workato/projects.json
 
-          echo "✅ Projects synced:"
+          echo "✅ Projects fetched:"
           cat .github/workato/projects.json | jq -r '.[].name'
 
-      - name: Commit if Changed
+      - name: Update Dropdown Options in Deploy Workflow
+        run: |
+          # Build the options block from project names
+          OPTIONS=$(cat .github/workato/projects.json | jq -r \
+            '[.[].name] | map("          - " + .) | join("\n")')
+
+          echo "Injecting these options into deploy workflow:"
+          echo "$OPTIONS"
+
+          # Replace everything between the markers in the deploy YAML
+          python3 - <<'EOF'
+          import re
+
+          with open('.github/workflows/workato-deploy.yml', 'r') as f:
+              content = f.read()
+
+          import subprocess
+          result = subprocess.run(
+              ['jq', '-r', '[.[].name] | map("          - " + .) | join("\n")',
+               '.github/workato/projects.json'],
+              capture_output=True, text=True
+          )
+          options = result.stdout.strip()
+
+          # Replace the options block between markers
+          new_block = "# AUTO-GENERATED START\n          options:\n" + options + "\n          # AUTO-GENERATED END"
+          content = re.sub(
+              r'# AUTO-GENERATED START.*?# AUTO-GENERATED END',
+              new_block,
+              content,
+              flags=re.DOTALL
+          )
+
+          with open('.github/workflows/workato-deploy.yml', 'w') as f:
+              f.write(content)
+
+          print("✅ Deploy workflow updated with latest project options")
+          EOF
+
+      - name: Commit Changes
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add .github/workato/projects.json
+          git add .github/workato/projects.json .github/workflows/workato-deploy.yml
           git diff --staged --quiet \
-            && echo "No changes to sync" \
-            || (git commit -m "🔄 Sync Workato projects [skip ci]" && git push)
+            && echo "No changes detected" \
+            || (git commit -m "🔄 Sync Workato project dropdown [skip ci]" && git push)
