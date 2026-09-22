@@ -8,9 +8,22 @@ on:
         required: true
         type: choice
         # AUTO-GENERATED START
-        options:
-          - (run Sync workflow first)
-        # AUTO-GENERATED END
+          options:
+          - AIRO Claude
+          - Submit Integration Request
+          - CICD Automation
+          - RBT
+          - FR_POC_API_SnowFlake_V1
+          - FR_AB_API_TEMPLATE_V1
+          - CH_POC_GENERIC_TEMPLATE_V1
+          - 01-Common
+          - Autonomous Operations Framework AOF
+          - Templates
+          - Automation Quality & Security AHQ
+          - iPaaS POC
+          - Spring
+          - Finance
+          # AUTO-GENERATED END
       target_env:
         description: "Target environment"
         required: true
