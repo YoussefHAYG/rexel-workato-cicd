@@ -1,0 +1,237 @@
+name: 🚀 Workato Deploy
+
+on:
+  workflow_dispatch:
+    inputs:
+      project_name:
+        description: "Project to deploy"
+        required: true
+        type: string
+      target_env:
+        description: "Target environment"
+        required: true
+        type: choice
+        options:
+          - test
+          - prod
+      notes:
+        description: "Deployment notes"
+        required: false
+        default: ""
+
+env:
+  WORKATO_BASE_URL: ${{ vars.WORKATO_BASE_URL }}
+
+jobs:
+
+  # ── 1. Resolve project → folder_id ──────────────────────
+  resolve:
+    name: "Resolve Project"
+    runs-on: ubuntu-latest
+    outputs:
+      folder_id: ${{ steps.resolve.outputs.folder_id }}
+    steps:
+      - name: Fetch Projects from Workato API & Resolve Folder ID
+        id: resolve
+        run: |
+          PROJECT="${{ github.event.inputs.project_name }}"
+
+          # Fetch live from Workato API (no file needed)
+          FOLDERS=$(curl -s \
+            -H "Authorization: Bearer ${{ secrets.WORKATO_DEV_API_TOKEN }}" \
+            "${{ env.WORKATO_BASE_URL }}/api/folders")
+
+          FOLDER_ID=$(echo $FOLDERS | jq -r \
+            --arg name "$PROJECT" \
+            '[.[] | select(.parent_folder_id == null)] | .[] | select(.name == $name) | .id | tostring')
+
+          if [ -z "$FOLDER_ID" ] || [ "$FOLDER_ID" = "null" ]; then
+            echo "❌ Project '$PROJECT' not found in Workato."
+            echo "Available top-level projects:"
+            echo $FOLDERS | jq -r '[.[] | select(.parent_folder_id == null)] | .[].name'
+            exit 1
+          fi
+
+          echo "folder_id=$FOLDER_ID" >> $GITHUB_OUTPUT
+          echo "✅ Project '$PROJECT' → Folder ID: $FOLDER_ID"
+
+  # ── 2. Export package from DEV ──────────────────────────
+  export:
+    name: "Export from DEV"
+    needs: resolve
+    runs-on: ubuntu-latest
+    outputs:
+      package_id: ${{ steps.export.outputs.package_id }}
+    steps:
+      - name: Create Export Manifest
+        id: manifest
+        run: |
+          PROJECT="${{ github.event.inputs.project_name }}"
+          FOLDER_ID="${{ needs.resolve.outputs.folder_id }}"
+
+          RESPONSE=$(curl -s -X POST \
+            -H "Authorization: Bearer ${{ secrets.WORKATO_DEV_API_TOKEN }}" \
+            -H "Content-Type: application/json" \
+            -d "{
+              \"export_manifest\": {
+                \"name\": \"$PROJECT - Run ${{ github.run_number }}\",
+                \"folder_id\": $FOLDER_ID,
+                \"auto_generate_assets\": true,
+                \"include_tags\": true
+              }
+            }" \
+            "${{ env.WORKATO_BASE_URL }}/api/export_manifests")
+
+          MANIFEST_ID=$(echo $RESPONSE | jq -r '.id')
+
+          if [ -z "$MANIFEST_ID" ] || [ "$MANIFEST_ID" = "null" ]; then
+            echo "❌ Failed to create manifest."
+            echo "API Response: $RESPONSE"
+            exit 1
+          fi
+
+          echo "manifest_id=$MANIFEST_ID" >> $GITHUB_OUTPUT
+          echo "✅ Manifest created: $MANIFEST_ID"
+
+      - name: Trigger Package Export
+        id: export
+        run: |
+          RESPONSE=$(curl -s -X POST \
+            -H "Authorization: Bearer ${{ secrets.WORKATO_DEV_API_TOKEN }}" \
+            "${{ env.WORKATO_BASE_URL }}/api/packages/export/${{ steps.manifest.outputs.manifest_id }}")
+
+          PACKAGE_ID=$(echo $RESPONSE | jq -r '.id')
+
+          if [ -z "$PACKAGE_ID" ] || [ "$PACKAGE_ID" = "null" ]; then
+            echo "❌ Failed to trigger export."
+            echo "API Response: $RESPONSE"
+            exit 1
+          fi
+
+          echo "package_id=$PACKAGE_ID" >> $GITHUB_OUTPUT
+          echo "✅ Export triggered: Package ID $PACKAGE_ID"
+
+      - name: Wait for Export to Complete
+        run: |
+          PACKAGE_ID="${{ steps.export.outputs.package_id }}"
+          STATUS="pending"
+          RETRIES=0
+
+          while [ "$STATUS" != "completed" ] && [ $RETRIES -lt 24 ]; do
+            sleep 10
+            RESPONSE=$(curl -s \
+              -H "Authorization: Bearer ${{ secrets.WORKATO_DEV_API_TOKEN }}" \
+              "${{ env.WORKATO_BASE_URL }}/api/packages/$PACKAGE_ID")
+            STATUS=$(echo $RESPONSE | jq -r '.status')
+            RETRIES=$((RETRIES+1))
+            echo "⏳ Status: $STATUS (attempt $RETRIES/24)"
+          done
+
+          if [ "$STATUS" != "completed" ]; then
+            echo "❌ Export timed out after 4 minutes."
+            exit 1
+          fi
+
+          echo "✅ Export completed successfully"
+
+      - name: Download Package
+        run: |
+          curl -s -o package.zip \
+            -H "Authorization: Bearer ${{ secrets.WORKATO_DEV_API_TOKEN }}" \
+            "${{ env.WORKATO_BASE_URL }}/api/packages/${{ steps.export.outputs.package_id }}/download"
+
+          SIZE=$(du -sh package.zip | cut -f1)
+          echo "✅ Package downloaded: $SIZE"
+
+      - name: Upload as GitHub Artifact
+        uses: actions/upload-artifact@v3
+        with:
+          name: workato-package-${{ github.run_id }}
+          path: package.zip
+          retention-days: 30
+
+  # ── 3. Deploy to TEST ───────────────────────────────────
+  deploy-test:
+    name: "Deploy → TEST (Pending Approval)"
+    needs: [resolve, export]
+    runs-on: ubuntu-latest
+    if: github.event.inputs.target_env == 'test'
+    environment: test      # 👈 Pauses here — requires 1 reviewer approval
+    steps:
+      - name: Download Package
+        uses: actions/download-artifact@v3
+        with:
+          name: workato-package-${{ github.run_id }}
+
+      - name: Deploy to TEST
+        run: |
+          RESPONSE=$(curl -s -X POST \
+            -H "Authorization: Bearer ${{ secrets.WORKATO_TEST_API_TOKEN }}" \
+            -H "Content-Type: application/octet-stream" \
+            --data-binary @package.zip \
+            "${{ env.WORKATO_BASE_URL }}/api/packages/import/${{ needs.resolve.outputs.folder_id }}?restart_recipes=true")
+
+          echo "API Response: $RESPONSE"
+          STATUS=$(echo $RESPONSE | jq -r '.status // "unknown"')
+
+          if [ "$STATUS" = "failed" ]; then
+            echo "❌ Deployment to TEST failed."
+            exit 1
+          fi
+
+          echo "✅ Deployed to TEST. Status: $STATUS"
+
+      - name: Write Deployment Summary
+        run: |
+          echo "## ✅ Deployed to TEST" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Field | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|---|---|" >> $GITHUB_STEP_SUMMARY
+          echo "| **Project** | ${{ github.event.inputs.project_name }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Environment** | TEST |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Deployed by** | @${{ github.actor }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Run** | #${{ github.run_number }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Notes** | ${{ github.event.inputs.notes }} |" >> $GITHUB_STEP_SUMMARY
+
+  # ── 4. Deploy to PROD ───────────────────────────────────
+  deploy-prod:
+    name: "Deploy → PROD (Pending Approval)"
+    needs: [resolve, export]
+    runs-on: ubuntu-latest
+    if: github.event.inputs.target_env == 'prod'
+    environment: prod      # 👈 Pauses here — requires 2 reviewer approvals
+    steps:
+      - name: Download Package
+        uses: actions/download-artifact@v3
+        with:
+          name: workato-package-${{ github.run_id }}
+
+      - name: Deploy to PROD
+        run: |
+          RESPONSE=$(curl -s -X POST \
+            -H "Authorization: Bearer ${{ secrets.WORKATO_PROD_API_TOKEN }}" \
+            -H "Content-Type: application/octet-stream" \
+            --data-binary @package.zip \
+            "${{ env.WORKATO_BASE_URL }}/api/packages/import/${{ needs.resolve.outputs.folder_id }}?restart_recipes=true")
+
+          echo "API Response: $RESPONSE"
+          STATUS=$(echo $RESPONSE | jq -r '.status // "unknown"')
+
+          if [ "$STATUS" = "failed" ]; then
+            echo "❌ Deployment to PROD failed."
+            exit 1
+          fi
+
+          echo "✅ Deployed to PROD. Status: $STATUS"
+
+      - name: Write Deployment Summary
+        run: |
+          echo "## ✅ Deployed to PROD" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Field | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|---|---|" >> $GITHUB_STEP_SUMMARY
+          echo "| **Project** | ${{ github.event.inputs.project_name }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Environment** | PROD |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Deployed by** | @${{ github.actor }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Run** | #${{ github.run_number }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Notes** | ${{ github.event.inputs.notes }} |" >> $GITHUB_STEP_SUMMARY
