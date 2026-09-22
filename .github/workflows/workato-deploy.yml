@@ -9,36 +9,22 @@ on:
         type: choice
         # AUTO-GENERATED START
         options:
-          - AIRO Claude
-          - Submit Integration Request
-          - CICD Automation
-          - RBT
-          - FR_POC_API_SnowFlake_V1
-          - FR_AB_API_TEMPLATE_V1
-          - CH_POC_GENERIC_TEMPLATE_V1
-          - 01-Common
-          - Autonomous Operations Framework AOF
-          - Templates
-          - Automation Quality & Security AHQ
-          - iPaaS POC
-          - Spring
-          - Finance
-          # AUTO-GENERATED END
+          - (run Sync workflow first)
+        # AUTO-GENERATED END
       target_env:
         description: "Target environment"
         required: true
         type: choice
         options:
-          - TEST
-          - PREPROD
-          - PRODUCTION
-      deployment_type:
-        description: "Deployment type"
+          - test
+          - prod
+      promote_properties:
+        description: "Also promote project properties?"
         required: true
         type: choice
         options:
-          - RLCM
-          - Project
+          - "yes"
+          - "no"
       release_type:
         description: "Release type"
         required: true
@@ -47,21 +33,6 @@ on:
           - Minor
           - Major
           - Bug Fixes
-      feature_branch_name:
-        description: "Feature branch name (must be unique)"
-        required: true
-        type: string
-      requestor_email:
-        description: "Requestor email"
-        required: true
-        type: string
-      promote_properties:
-        description: "Also promote project properties?"
-        required: true
-        type: choice
-        options:
-          - "yes"
-          - "no"
       notes:
         description: "Deployment notes"
         required: false
@@ -69,33 +40,21 @@ on:
 
 env:
   WORKATO_BASE_URL: ${{ vars.WORKATO_BASE_URL }}
-  CICD_API_BASE: https://apim.eu.workato.com/dev_rexel/cicd-automation-api-v1
-  CICD_API_TOKEN: ${{ secrets.WORKATO_CICD_API_TOKEN }}
 
 jobs:
 
   # ── 1. Resolve Project → Folder ID ──────────────────────
   resolve:
-    name: "Resolve Project: ${{ github.event.inputs.project_name }}"
+    name: "Resolve: ${{ github.event.inputs.project_name }}"
     runs-on: ubuntu-latest
     outputs:
       folder_id: ${{ steps.resolve.outputs.folder_id }}
-      workspace_name: ${{ steps.resolve.outputs.workspace_name }}
     steps:
-      - name: Fetch Projects from Workato & Resolve Folder ID
+      - name: Fetch Projects & Resolve Folder ID
         id: resolve
         run: |
           PROJECT="${{ github.event.inputs.project_name }}"
 
-          # Get workspace name (for CICD API payload)
-          WS_RESPONSE=$(curl -s \
-            -H "Authorization: Bearer ${{ secrets.WORKATO_DEV_API_TOKEN }}" \
-            "${{ env.WORKATO_BASE_URL }}/api/users/me")
-          WORKSPACE_NAME=$(echo $WS_RESPONSE | jq -r '.team_name // .name')
-          echo "workspace_name=$WORKSPACE_NAME" >> $GITHUB_OUTPUT
-          echo "✅ Workspace: $WORKSPACE_NAME"
-
-          # Resolve folder ID from project name
           FOLDERS=$(curl -s \
             -H "Authorization: Bearer ${{ secrets.WORKATO_DEV_API_TOKEN }}" \
             "${{ env.WORKATO_BASE_URL }}/api/folders")
@@ -116,38 +75,64 @@ jobs:
 
   # ── 2. Promote Project Properties (optional) ────────────
   promote-properties:
-    name: "Promote Project Properties (DEV → ${{ github.event.inputs.target_env }})"
+    name: "Promote Properties → ${{ github.event.inputs.target_env }}"
     needs: resolve
     runs-on: ubuntu-latest
     if: github.event.inputs.promote_properties == 'yes'
     steps:
-      - name: Call Workato Promote Properties API
+      - name: Read Properties from DEV
+        id: read
         run: |
-          TARGET="${{ github.event.inputs.target_env }}"
           FOLDER_ID="${{ needs.resolve.outputs.folder_id }}"
-          WORKSPACE="${{ needs.resolve.outputs.workspace_name }}"
 
-          RESPONSE=$(curl -s -X PUT \
-            -H "Authorization: Bearer ${{ env.CICD_API_TOKEN }}" \
-            -H "Content-Type: application/json" \
-            -d "{
-              \"workspace_name\": \"$WORKSPACE\",
-              \"source_environment\": \"DEV\",
-              \"target_environment\": \"$TARGET\",
-              \"project_asset_id\": \"$FOLDER_ID\"
-            }" \
-            "${{ env.CICD_API_BASE }}/promote-project-properties")
+          # Fetch all project properties from DEV using folder (project) scope
+          PROPS=$(curl -s \
+            -H "Authorization: Bearer ${{ secrets.WORKATO_DEV_API_TOKEN }}" \
+            "${{ env.WORKATO_BASE_URL }}/api/properties?prefix=project_${FOLDER_ID}_")
 
-          echo "API Response: $RESPONSE"
-          STATUS=$(echo $RESPONSE | jq -r '.status // .message // "unknown"')
+          echo "Properties fetched from DEV:"
+          echo $PROPS | jq .
 
-          if echo $RESPONSE | jq -e '.error' > /dev/null 2>&1; then
-            echo "❌ Property promotion failed: $RESPONSE"
-            exit 1
+          # Save to file for next step
+          echo $PROPS > dev_properties.json
+
+      - name: Write Properties to Target
+        run: |
+          TARGET_ENV="${{ github.event.inputs.target_env }}"
+
+          # Select correct token for target
+          if [ "$TARGET_ENV" = "test" ]; then
+            TARGET_TOKEN="${{ secrets.WORKATO_TEST_API_TOKEN }}"
+          else
+            TARGET_TOKEN="${{ secrets.WORKATO_PROD_API_TOKEN }}"
           fi
 
-          RECORD_ID=$(echo $RESPONSE | jq -r '.record_id // "N/A"')
-          echo "✅ Properties promotion queued. Record ID: $RECORD_ID"
+          # Read properties saved from DEV
+          PROPS=$(cat dev_properties.json)
+          COUNT=$(echo $PROPS | jq 'length')
+
+          if [ "$COUNT" = "0" ] || [ "$COUNT" = "null" ]; then
+            echo "ℹ️ No properties found for this project in DEV. Skipping."
+            exit 0
+          fi
+
+          echo "Promoting $COUNT properties to $TARGET_ENV..."
+
+          # Upsert each property into target environment
+          echo $PROPS | jq -c '.[]' | while read PROP; do
+            NAME=$(echo $PROP | jq -r '.name')
+            VALUE=$(echo $PROP | jq -r '.value')
+
+            curl -s -X POST \
+              -H "Authorization: Bearer $TARGET_TOKEN" \
+              -H "Content-Type: application/json" \
+              -d "{\"name\": \"$NAME\", \"value\": \"$VALUE\"}" \
+              "${{ env.WORKATO_BASE_URL }}/api/properties" > /dev/null
+
+            echo "  ✅ Promoted: $NAME"
+          done
+
+          echo "✅ All $COUNT properties promoted to $TARGET_ENV"
 
       - name: Summary
         run: |
@@ -158,114 +143,209 @@ jobs:
           echo "| **From** | DEV |" >> $GITHUB_STEP_SUMMARY
           echo "| **To** | ${{ github.event.inputs.target_env }} |" >> $GITHUB_STEP_SUMMARY
 
-  # ── 3a. Build & Deploy to TEST ──────────────────────────
+  # ── 3. Export Package from DEV ──────────────────────────
+  export:
+    name: "Export Package from DEV"
+    needs: [resolve, promote-properties]
+    runs-on: ubuntu-latest
+    if: |
+      always() &&
+      needs.resolve.result == 'success' &&
+      (needs.promote-properties.result == 'success' || needs.promote-properties.result == 'skipped')
+    outputs:
+      package_id: ${{ steps.export.outputs.package_id }}
+    steps:
+      - name: Create Export Manifest
+        id: manifest
+        run: |
+          PROJECT="${{ github.event.inputs.project_name }}"
+          FOLDER_ID="${{ needs.resolve.outputs.folder_id }}"
+
+          RESPONSE=$(curl -s -X POST \
+            -H "Authorization: Bearer ${{ secrets.WORKATO_DEV_API_TOKEN }}" \
+            -H "Content-Type: application/json" \
+            -d "{
+              \"export_manifest\": {
+                \"name\": \"$PROJECT - ${{ github.event.inputs.release_type }} - Run ${{ github.run_number }}\",
+                \"folder_id\": $FOLDER_ID,
+                \"auto_generate_assets\": true,
+                \"include_tags\": true
+              }
+            }" \
+            "${{ env.WORKATO_BASE_URL }}/api/export_manifests")
+
+          MANIFEST_ID=$(echo $RESPONSE | jq -r '.id')
+
+          if [ -z "$MANIFEST_ID" ] || [ "$MANIFEST_ID" = "null" ]; then
+            echo "❌ Failed to create manifest."
+            echo "Response: $RESPONSE"
+            exit 1
+          fi
+
+          echo "manifest_id=$MANIFEST_ID" >> $GITHUB_OUTPUT
+          echo "✅ Manifest created: $MANIFEST_ID"
+
+      - name: Trigger Package Export
+        id: export
+        run: |
+          RESPONSE=$(curl -s -X POST \
+            -H "Authorization: Bearer ${{ secrets.WORKATO_DEV_API_TOKEN }}" \
+            "${{ env.WORKATO_BASE_URL }}/api/packages/export/${{ steps.manifest.outputs.manifest_id }}")
+
+          PACKAGE_ID=$(echo $RESPONSE | jq -r '.id')
+
+          if [ -z "$PACKAGE_ID" ] || [ "$PACKAGE_ID" = "null" ]; then
+            echo "❌ Failed to trigger export."
+            echo "Response: $RESPONSE"
+            exit 1
+          fi
+
+          echo "package_id=$PACKAGE_ID" >> $GITHUB_OUTPUT
+          echo "✅ Export triggered: Package ID $PACKAGE_ID"
+
+      - name: Wait for Export to Complete
+        run: |
+          PACKAGE_ID="${{ steps.export.outputs.package_id }}"
+          STATUS="pending"
+          RETRIES=0
+
+          while [ "$STATUS" != "completed" ] && [ $RETRIES -lt 24 ]; do
+            sleep 10
+            RESPONSE=$(curl -s \
+              -H "Authorization: Bearer ${{ secrets.WORKATO_DEV_API_TOKEN }}" \
+              "${{ env.WORKATO_BASE_URL }}/api/packages/$PACKAGE_ID")
+            STATUS=$(echo $RESPONSE | jq -r '.status')
+            RETRIES=$((RETRIES+1))
+            echo "⏳ Status: $STATUS (attempt $RETRIES/24)"
+          done
+
+          if [ "$STATUS" != "completed" ]; then
+            echo "❌ Export timed out after 4 minutes."
+            exit 1
+          fi
+
+          echo "✅ Export completed"
+
+      - name: Download Package
+        run: |
+          curl -s -o package.zip \
+            -H "Authorization: Bearer ${{ secrets.WORKATO_DEV_API_TOKEN }}" \
+            "${{ env.WORKATO_BASE_URL }}/api/packages/${{ steps.export.outputs.package_id }}/download"
+
+          SIZE=$(du -sh package.zip | cut -f1)
+          echo "✅ Package downloaded: $SIZE"
+
+      - name: Upload as GitHub Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: workato-package-${{ github.run_id }}
+          path: package.zip
+          retention-days: 30
+
+  # ── 4. Deploy to TEST ───────────────────────────────────
   deploy-test:
     name: "Deploy → TEST (Pending Approval)"
-    needs: [resolve, promote-properties]
+    needs: [resolve, export]
     runs-on: ubuntu-latest
     if: |
       always() &&
-      needs.resolve.result == 'success' &&
-      github.event.inputs.target_env == 'TEST' &&
-      (needs.promote-properties.result == 'success' || needs.promote-properties.result == 'skipped')
+      needs.export.result == 'success' &&
+      github.event.inputs.target_env == 'test'
     environment: test      # 👈 Pauses for 1 reviewer approval
     steps:
-      - name: Call Workato Build & Deploy to Test API
-        id: deploy
+      - name: Download Package
+        uses: actions/download-artifact@v4
+        with:
+          name: workato-package-${{ github.run_id }}
+
+      - name: Import Package to TEST
         run: |
           FOLDER_ID="${{ needs.resolve.outputs.folder_id }}"
-          WORKSPACE="${{ needs.resolve.outputs.workspace_name }}"
 
           RESPONSE=$(curl -s -X POST \
-            -H "Authorization: Bearer ${{ env.CICD_API_TOKEN }}" \
-            -H "Content-Type: application/json" \
-            -d "{
-              \"build_comments\": \"${{ github.event.inputs.notes }} | Run #${{ github.run_number }} by ${{ github.actor }}\",
-              \"feature_branch_name\": \"${{ github.event.inputs.feature_branch_name }}\",
-              \"deployment_type\": \"${{ github.event.inputs.deployment_type }}\",
-              \"workspace_name\": \"$WORKSPACE\",
-              \"release_type\": \"${{ github.event.inputs.release_type }}\",
-              \"asset_id\": \"$FOLDER_ID\",
-              \"requestor_email\": \"${{ github.event.inputs.requestor_email }}\"
-            }" \
-            "${{ env.CICD_API_BASE }}/build-and-deploy-to-test")
+            -H "Authorization: Bearer ${{ secrets.WORKATO_TEST_API_TOKEN }}" \
+            -H "Content-Type: application/octet-stream" \
+            --data-binary @package.zip \
+            "${{ env.WORKATO_BASE_URL }}/api/packages/import/$FOLDER_ID?restart_recipes=true")
 
-          echo "API Response: $RESPONSE"
+          echo "Response: $RESPONSE"
+          STATUS=$(echo $RESPONSE | jq -r '.status // "unknown"')
 
-          if echo $RESPONSE | jq -e '.error' > /dev/null 2>&1; then
-            echo "❌ Deployment failed: $RESPONSE"
+          if [ "$STATUS" = "failed" ]; then
+            echo "❌ Import to TEST failed."
             exit 1
           fi
 
-          RECORD_ID=$(echo $RESPONSE | jq -r '.record_id // "N/A"')
-          echo "record_id=$RECORD_ID" >> $GITHUB_OUTPUT
-          echo "✅ Deployment queued. Record ID: $RECORD_ID"
+          echo "✅ Imported to TEST. Status: $STATUS"
+
+          # Show per-recipe import results
+          echo ""
+          echo "📋 Recipe import results:"
+          echo $RESPONSE | jq -r '.recipe_imports[]? | "  " + .status + " → " + .recipe.name' 2>/dev/null || true
 
       - name: Deployment Summary
         run: |
-          echo "## ✅ Build & Deploy to TEST Triggered" >> $GITHUB_STEP_SUMMARY
+          echo "## ✅ Deployed to TEST" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "| Field | Value |" >> $GITHUB_STEP_SUMMARY
           echo "|---|---|" >> $GITHUB_STEP_SUMMARY
           echo "| **Project** | ${{ github.event.inputs.project_name }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| **Branch** | ${{ github.event.inputs.feature_branch_name }} |" >> $GITHUB_STEP_SUMMARY
           echo "| **Release Type** | ${{ github.event.inputs.release_type }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| **Deployment Type** | ${{ github.event.inputs.deployment_type }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| **Requestor** | ${{ github.event.inputs.requestor_email }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| **Record ID** | ${{ steps.deploy.outputs.record_id }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Properties Promoted** | ${{ github.event.inputs.promote_properties }} |" >> $GITHUB_STEP_SUMMARY
           echo "| **Deployed by** | @${{ github.actor }} |" >> $GITHUB_STEP_SUMMARY
           echo "| **Run** | #${{ github.run_number }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Notes** | ${{ github.event.inputs.notes }} |" >> $GITHUB_STEP_SUMMARY
 
-  # ── 3b. Deploy to PREPROD / PRODUCTION ──────────────────
+  # ── 5. Deploy to PROD ───────────────────────────────────
   deploy-prod:
-    name: "Deploy → ${{ github.event.inputs.target_env }} (Pending Approval)"
-    needs: [resolve, promote-properties]
+    name: "Deploy → PROD (Pending Approval)"
+    needs: [resolve, export]
     runs-on: ubuntu-latest
     if: |
       always() &&
-      needs.resolve.result == 'success' &&
-      (github.event.inputs.target_env == 'PREPROD' || github.event.inputs.target_env == 'PRODUCTION') &&
-      (needs.promote-properties.result == 'success' || needs.promote-properties.result == 'skipped')
-    environment: ${{ github.event.inputs.target_env == 'PRODUCTION' && 'prod' || 'preprod' }}
+      needs.export.result == 'success' &&
+      github.event.inputs.target_env == 'prod'
+    environment: prod      # 👈 Pauses for 2 reviewer approvals
     steps:
-      - name: Call Workato Deploy API
-        id: deploy
+      - name: Download Package
+        uses: actions/download-artifact@v4
+        with:
+          name: workato-package-${{ github.run_id }}
+
+      - name: Import Package to PROD
         run: |
           FOLDER_ID="${{ needs.resolve.outputs.folder_id }}"
-          WORKSPACE="${{ needs.resolve.outputs.workspace_name }}"
-          TARGET="${{ github.event.inputs.target_env }}"
 
           RESPONSE=$(curl -s -X POST \
-            -H "Authorization: Bearer ${{ env.CICD_API_TOKEN }}" \
-            -H "Content-Type: application/json" \
-            -d "{
-              \"deployment_comments\": \"${{ github.event.inputs.notes }} | Run #${{ github.run_number }} by ${{ github.actor }}\",
-              \"workspace_name\": \"$WORKSPACE\",
-              \"release_details_record_id\": \"$FOLDER_ID\",
-              \"target_environment\": \"$TARGET\"
-            }" \
-            "${{ env.CICD_API_BASE }}/deploy")
+            -H "Authorization: Bearer ${{ secrets.WORKATO_PROD_API_TOKEN }}" \
+            -H "Content-Type: application/octet-stream" \
+            --data-binary @package.zip \
+            "${{ env.WORKATO_BASE_URL }}/api/packages/import/$FOLDER_ID?restart_recipes=true")
 
-          echo "API Response: $RESPONSE"
+          echo "Response: $RESPONSE"
+          STATUS=$(echo $RESPONSE | jq -r '.status // "unknown"')
 
-          if echo $RESPONSE | jq -e '.error' > /dev/null 2>&1; then
-            echo "❌ Deployment failed: $RESPONSE"
+          if [ "$STATUS" = "failed" ]; then
+            echo "❌ Import to PROD failed."
             exit 1
           fi
 
-          RECORD_ID=$(echo $RESPONSE | jq -r '.record_id // "N/A"')
-          echo "record_id=$RECORD_ID" >> $GITHUB_OUTPUT
-          echo "✅ Deployment queued. Record ID: $RECORD_ID"
+          echo "✅ Imported to PROD. Status: $STATUS"
+
+          # Show per-recipe import results
+          echo ""
+          echo "📋 Recipe import results:"
+          echo $RESPONSE | jq -r '.recipe_imports[]? | "  " + .status + " → " + .recipe.name' 2>/dev/null || true
 
       - name: Deployment Summary
         run: |
-          echo "## ✅ Deployed to ${{ github.event.inputs.target_env }}" >> $GITHUB_STEP_SUMMARY
+          echo "## ✅ Deployed to PROD" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "| Field | Value |" >> $GITHUB_STEP_SUMMARY
           echo "|---|---|" >> $GITHUB_STEP_SUMMARY
           echo "| **Project** | ${{ github.event.inputs.project_name }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| **Environment** | ${{ github.event.inputs.target_env }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| **Record ID** | ${{ steps.deploy.outputs.record_id }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Release Type** | ${{ github.event.inputs.release_type }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Properties Promoted** | ${{ github.event.inputs.promote_properties }} |" >> $GITHUB_STEP_SUMMARY
           echo "| **Deployed by** | @${{ github.actor }} |" >> $GITHUB_STEP_SUMMARY
           echo "| **Run** | #${{ github.run_number }} |" >> $GITHUB_STEP_SUMMARY
           echo "| **Notes** | ${{ github.event.inputs.notes }} |" >> $GITHUB_STEP_SUMMARY
