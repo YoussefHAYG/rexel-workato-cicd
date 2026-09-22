@@ -98,7 +98,7 @@ jobs:
             }" \
             "${{ env.WORKATO_BASE_URL }}/api/export_manifests")
 
-          MANIFEST_ID=$(echo $RESPONSE | jq -r '.id')
+          MANIFEST_ID=$(echo $RESPONSE | jq -r '.result.id')
 
           if [ -z "$MANIFEST_ID" ] || [ "$MANIFEST_ID" = "null" ]; then
             echo "❌ Failed to create manifest."
